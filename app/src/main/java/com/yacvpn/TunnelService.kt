@@ -32,7 +32,7 @@ class TunnelService : VpnService() {
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var vpnInterface: ParcelFileDescriptor? = null
+    private var vpnInterface: android.os.ParcelFileDescriptor? = null
     private var webSocket: WebSocket? = null
     private val streams = ConcurrentHashMap<Int, StreamCtx>()
     private val streamSeq = AtomicInteger(1)
