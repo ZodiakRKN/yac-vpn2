@@ -32,10 +32,13 @@ class MainActivity : AppCompatActivity() {
         binding.etToken.setText(prefs.getString("token", "3f4hjfjn"))
 
         binding.btnConnect.setOnClickListener {
-            saveConfig()
-            val intent = VpnService.prepare(this)
-            if (intent != null) vpnLauncher.launch(intent)
-            else startTunnel()
+    val prepare = VpnService.prepare(this)
+    if (prepare != null) {
+        vpnLauncher.launch(prepare)
+    } else {
+        startTunnel()
+    }
+}
         }
 
         binding.btnDisconnect.setOnClickListener {
@@ -59,14 +62,19 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startTunnel() {
-        val intent = Intent(this, TunnelService::class.java).apply {
-            action = TunnelService.ACTION_START
-            putExtra("gateway", binding.etGateway.text.toString().trim())
-            putExtra("token", binding.etToken.text.toString().trim())
-        }
-        startForegroundService(intent)
-        Toast.makeText(this, "Подключение...", Toast.LENGTH_SHORT).show()
+    val gw = binding.etGateway.text.toString().trim()
+    val token = binding.etToken.text.toString().trim()
+    if (gw.isEmpty() || token.isEmpty()) {
+        Toast.makeText(this, "Заполните Gateway и Token", Toast.LENGTH_SHORT).show()
+        return
     }
+    val intent = Intent(this, TunnelService::class.java).apply {
+        action = TunnelService.ACTION_START
+        putExtra("gateway", gw)
+        putExtra("token", token)
+    }
+    startForegroundService(intent)
+}
 
     private fun stopTunnel() {
         startService(Intent(this, TunnelService::class.java).apply {
