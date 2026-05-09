@@ -51,17 +51,22 @@ class TunnelService : VpnService() {
     private val HDR = 11 // 1+4+4+2
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_START -> {
-                val gw = intent.getStringExtra("gateway") ?: return START_NOT_STICKY
-                val token = intent.getStringExtra("token") ?: return START_NOT_STICKY
-                startForeground(NOTIF_ID, buildNotif("Подключение..."))
-                connect(gw, token)
+    when (intent?.action) {
+        ACTION_START -> {
+            val gw = intent.getStringExtra("gateway")
+            val token = intent.getStringExtra("token")
+            if (gw == null || token == null) {
+                status.postValue("❌ Ошибка: gateway или token = null")
+                stopSelf()
+                return START_NOT_STICKY
             }
-            ACTION_STOP -> stop()
+            startForeground(NOTIF_ID, buildNotif("Подключение..."))
+            connect(gw, token)
         }
-        return START_NOT_STICKY
+        ACTION_STOP -> stop()
     }
+    return START_NOT_STICKY
+}
 
     private fun connect(gatewayUrl: String, token: String) {
         status.postValue("🔄 Подключение...")
