@@ -37,6 +37,7 @@ class MainActivity : AppCompatActivity() {
         )
 
         binding.btnConnect.setOnClickListener {
+            try {
             saveConfig()
             val prepare = VpnService.prepare(this@MainActivity)
             if (prepare != null) {
@@ -44,7 +45,10 @@ class MainActivity : AppCompatActivity() {
             } else {
                 startTunnel()
             }
-        }
+        } catch (e: Exception) {
+    Toast.makeText(this@MainActivity, "CRASH: ${e.javaClass.simpleName}: ${e.message}", Toast.LENGTH_LONG).show()
+    e.printStackTrace()
+}}
 
         binding.btnDisconnect.setOnClickListener {
             stopTunnel()
