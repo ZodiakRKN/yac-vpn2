@@ -1,22 +1,40 @@
 package com.yacvpn
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.VpnService
-import android.os.IBinder
+import android.os.Build
 import android.util.Log
 import androidx.lifecycle.MutableLiveData
-import kotlinx.coroutines.*
-import okhttp3.*
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.net.*
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class TunnelService : VpnService() {
@@ -25,77 +43,96 @@ class TunnelService : VpnService() {
         private const val TAG = "TunnelService"
         const val ACTION_START = "START"
         const val ACTION_STOP = "STOP"
-        const val CHANNEL_ID = "vpn_channel"
+        const val CHANNEL_ID = "vpn_ch"
         const val NOTIF_ID = 1
-
         val status = MutableLiveData("⚪ Отключено")
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var vpnInterface: android.os.ParcelFileDescriptor? = null
     private var webSocket: WebSocket? = null
     private val streams = ConcurrentHashMap<Int, StreamCtx>()
     private val streamSeq = AtomicInteger(1)
     private val msgSeq = AtomicInteger(0)
-    private var connected = false
 
-    // Frame types
+    @Volatile private var connected = false
+    @Volatile private var running = false
+
     private val T_HELLO: Byte = 0x01
     private val T_HELLO_ACK: Byte = 0x02
     private val T_OPEN: Byte = 0x03
     private val T_OPEN_OK: Byte = 0x04
     private val T_DATA: Byte = 0x05
     private val T_FIN: Byte = 0x06
-    private val T_PING: Byte = 0x07
-    private val T_PONG: Byte = 0x08
-    private val HDR = 11 // 1+4+4+2
+    private val HDR = 11
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-    when (intent?.action) {
-        ACTION_START -> {
-            val gw = intent.getStringExtra("gateway")
-            val token = intent.getStringExtra("token")
-            if (gw == null || token == null) {
-                status.postValue("❌ Ошибка: gateway или token = null")
-                stopSelf()
-                return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_START -> {
+                val gw = intent.getStringExtra("gateway")
+                val token = intent.getStringExtra("token")
+                if (gw == null || token == null) {
+                    status.postValue("❌ gateway или token = null")
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
+                createChannel()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(NOTIF_ID, buildNotif("Подключение..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                } else {
+                    startForeground(NOTIF_ID, buildNotif("Подключение..."))
+                }
+                running = true
+                scope.launch { connect(gw, token) }
             }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-    if (android.os.Build.VERSION.SDK_INT >= 29) {
-    startForeground(NOTIF_ID, buildNotif("Подключение..."), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-} else {
-    startForeground(NOTIF_ID, buildNotif("Подключение..."))
-}
-} else {
-    startForeground(NOTIF_ID, buildNotif("Подключение..."))
-}
-        ACTION_STOP -> stop()
+            ACTION_STOP -> stop()
+        }
+        return START_NOT_STICKY
     }
-    return START_NOT_STICKY
-}
 
-    private fun connect(gatewayUrl: String, token: String) {
+    private suspend fun connect(gw: String, token: String) {
         status.postValue("🔄 Подключение...")
-        val client = OkHttpClient()
-        val req = Request.Builder().url(gatewayUrl).build()
-        webSocket = client.newWebSocket(req, object : WebSocketListener() {
-            override fun onOpen(ws: WebSocket, response: Response) {
-                sendFrame(ws, T_HELLO, 0, token.toByteArray())
+        try {
+            val client = OkHttpClient.Builder()
+                .readTimeout(0, TimeUnit.MILLISECONDS)
+                .build()
+            val req = Request.Builder().url(gw).build()
+            webSocket = client.newWebSocket(req, WsListener(gw, token))
+        } catch (e: Exception) {
+            Log.e(TAG, "connect: ${e.message}", e)
+            status.postValue("❌ ${e.message}")
+        }
+    }
+
+    inner class WsListener(
+        private val gw: String,
+        private val token: String
+    ) : WebSocketListener() {
+
+        override fun onOpen(ws: WebSocket, response: Response) {
+            Log.i(TAG, "WS opened")
+            sendFrame(ws, T_HELLO, 0, token.toByteArray())
+        }
+
+        override fun onMessage(ws: WebSocket, bytes: ByteString) {
+            handleFrame(bytes.toByteArray())
+        }
+
+        override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+            Log.e(TAG, "WS failure: ${t.message}")
+            connected = false
+            status.postValue("❌ ${t.message}")
+            if (running) {
+                scope.launch {
+                    delay(5000)
+                    connect(gw, token)
+                }
             }
-            override fun onMessage(ws: WebSocket, bytes: ByteString) {
-                handleFrame(bytes.toByteArray())
-            }
-            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "WS failure: ${t.message}")
-                status.postValue("❌ Ошибка: ${t.message}")
-                connected = false
-                scheduleReconnect(gatewayUrl, token)
-            }
-            override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                connected = false
-                status.postValue("⚪ Отключено")
-            }
-        })
+        }
+
+        override fun onClosed(ws: WebSocket, code: Int, reason: String) {
+            connected = false
+            status.postValue("⚪ Отключено")
+        }
     }
 
     private fun handleFrame(data: ByteArray) {
@@ -103,7 +140,7 @@ class TunnelService : VpnService() {
         val buf = ByteBuffer.wrap(data).order(ByteOrder.BIG_ENDIAN)
         val type = buf.get()
         val sid = buf.int
-        buf.int // seqId
+        buf.int
         val len = buf.short.toInt() and 0xFFFF
         val payload = if (len > 0) ByteArray(len).also { buf.get(it) } else ByteArray(0)
 
@@ -112,17 +149,14 @@ class TunnelService : VpnService() {
                 connected = true
                 status.postValue("✅ Подключено")
                 updateNotif("✅ Подключено")
-                startSocks5()
+                scope.launch { startSocks5() }
             }
             T_OPEN_OK -> streams[sid]?.openOk?.complete(Unit)
-            T_DATA -> {
-                streams[sid]?.queue?.offer(payload)
-            }
+            T_DATA -> streams[sid]?.queue?.offer(payload)
             T_FIN -> {
                 streams[sid]?.closed = true
                 streams.remove(sid)
             }
-            T_PONG -> Log.d(TAG, "pong")
         }
     }
 
@@ -136,106 +170,134 @@ class TunnelService : VpnService() {
         ws.send(buf.array().toByteString())
     }
 
-    private fun startSocks5() {
-        scope.launch {
-            val server = ServerSocket(1080, 50, InetAddress.getByName("127.0.0.1"))
-            while (isActive && connected) {
-                try {
-                    val client = server.accept()
-                    launch { handleSocks5(client) }
-                } catch (e: Exception) {
-                    if (isActive) Log.e(TAG, "accept: ${e.message}")
-                }
-            }
-            server.close()
+    private suspend fun startSocks5() {
+        val server = try {
+            ServerSocket(1080, 50, InetAddress.getByName("127.0.0.1"))
+        } catch (e: Exception) {
+            status.postValue("❌ Порт занят: ${e.message}")
+            return
         }
+        while (running && connected) {
+            try {
+                val client = withContext(Dispatchers.IO) { server.accept() }
+                scope.launch { handleSocks5(client) }
+            } catch (e: Exception) {
+                if (running) Log.e(TAG, "accept: ${e.message}")
+            }
+        }
+        server.close()
     }
 
     private suspend fun handleSocks5(sock: Socket) = withContext(Dispatchers.IO) {
         try {
             val inp = sock.getInputStream()
             val out = sock.getOutputStream()
-            // Auth
-            inp.read(); val n = inp.read(); repeat(n) { inp.read() }
+            inp.read()
+            val n = inp.read()
+            repeat(n) { inp.read() }
             out.write(byteArrayOf(5, 0))
-            // Request
+
             val hdr = ByteArray(4).also { inp.read(it) }
-            if (hdr[1] != 1.toByte()) { sock.close(); return@withContext }
+            if (hdr[1] != 1.toByte()) {
+                sock.close()
+                return@withContext
+            }
+
             val host = when (hdr[3].toInt()) {
-                1 -> { val a = ByteArray(4).also { inp.read(it) }; InetAddress.getByAddress(a).hostAddress!! }
-                3 -> { val l = inp.read(); ByteArray(l).also { inp.read(it) }.toString(Charsets.UTF_8) }
-                else -> { sock.close(); return@withContext }
+                1 -> {
+                    val a = ByteArray(4).also { inp.read(it) }
+                    InetAddress.getByAddress(a).hostAddress!!
+                }
+                3 -> {
+                    val l = inp.read()
+                    ByteArray(l).also { inp.read(it) }.toString(Charsets.UTF_8)
+                }
+                else -> {
+                    sock.close()
+                    return@withContext
+                }
             }
             val port = (inp.read() shl 8) or inp.read()
 
-            // Open tunnel stream
             val ws = webSocket ?: run { sock.close(); return@withContext }
             val sid = streamSeq.getAndAdd(2)
             val ctx = StreamCtx()
             streams[sid] = ctx
             sendFrame(ws, T_OPEN, sid, "$host:$port".toByteArray())
 
-            // Wait open ack
-            try { withTimeout(8000) { ctx.openOk.await() } }
-            catch (e: Exception) {
+            try {
+                withTimeout(8000) { ctx.openOk.await() }
+            } catch (e: Exception) {
                 out.write(byteArrayOf(5, 1, 0, 1, 0, 0, 0, 0, 0, 0))
-                sock.close(); return@withContext
+                sock.close()
+                return@withContext
             }
+
             out.write(byteArrayOf(5, 0, 0, 1, 0, 0, 0, 0, 0, 0))
             out.flush()
 
-            // Relay
-            val readJob = launch {
-                val buf = ByteArray(8192)
+            val r = launch {
+                val readBuf = ByteArray(8192)
                 try {
                     while (isActive && !ctx.closed) {
-                        val n = inp.read(buf)
-                        if (n < 0) break
-                        sendFrame(ws, T_DATA, sid, buf.copyOf(n))
+                        val read = inp.read(readBuf)
+                        if (read < 0) break
+                        sendFrame(ws, T_DATA, sid, readBuf.copyOf(read))
                     }
-                } finally { sendFrame(ws, T_FIN, sid) }
+                } finally {
+                    sendFrame(ws, T_FIN, sid)
+                }
             }
-            val writeJob = launch {
+
+            val w = launch {
                 try {
                     while (isActive && !ctx.closed) {
-                        val d = ctx.queue.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS) ?: continue
-                        out.write(d); out.flush()
+                        val d = ctx.queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                        out.write(d)
+                        out.flush()
                     }
-                } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    Log.d(TAG, "write done: ${e.message}")
+                }
             }
-            readJob.join()
-            writeJob.cancelAndJoin()
+
+            r.join()
+            w.cancelAndJoin()
+
         } catch (e: Exception) {
             Log.e(TAG, "socks5: ${e.message}")
         } finally {
-            try { sock.close() } catch (_: Exception) {}
+            try { sock.close() } catch (e: Exception) { }
         }
     }
 
-    private fun scheduleReconnect(gw: String, token: String) {
-        scope.launch { delay(5000); connect(gw, token) }
-    }
-
     fun stop() {
+        running = false
+        connected = false
         scope.cancel()
         webSocket?.close(1000, "stop")
-        vpnInterface?.close()
-        vpnInterface = null
-        connected = false
+        webSocket = null
+        streams.clear()
         status.postValue("⚪ Отключено")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    override fun onDestroy() { stop(); super.onDestroy() }
+    override fun onDestroy() {
+        stop()
+        super.onDestroy()
+    }
 
-    private fun buildNotif(text: String): Notification {
+    private fun createChannel() {
         val mgr = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (mgr.getNotificationChannel(CHANNEL_ID) == null) {
             mgr.createNotificationChannel(
                 NotificationChannel(CHANNEL_ID, "VPN", NotificationManager.IMPORTANCE_LOW)
             )
         }
+    }
+
+    private fun buildNotif(text: String): Notification {
         return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("YAC Bridge VPN")
             .setContentText(text)
