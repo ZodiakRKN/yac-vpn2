@@ -60,9 +60,11 @@ class TunnelService : VpnService() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            startForeground(NOTIF_ID, buildNotif("Подключение..."))
-            connect(gw, token)
-        }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+    startForeground(NOTIF_ID, buildNotif("Подключение..."), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+} else {
+    startForeground(NOTIF_ID, buildNotif("Подключение..."))
+}
         ACTION_STOP -> stop()
     }
     return START_NOT_STICKY
