@@ -61,7 +61,11 @@ class TunnelService : VpnService() {
                 return START_NOT_STICKY
             }
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+    if (android.os.Build.VERSION.SDK_INT >= 29) {
     startForeground(NOTIF_ID, buildNotif("Подключение..."), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+} else {
+    startForeground(NOTIF_ID, buildNotif("Подключение..."))
+}
 } else {
     startForeground(NOTIF_ID, buildNotif("Подключение..."))
 }
